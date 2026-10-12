@@ -1,0 +1,4 @@
+.venv/
+yolo11n.pt
+__pycache__/
+.idea/
