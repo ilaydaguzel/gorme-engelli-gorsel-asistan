@@ -1,69 +1,155 @@
 import cv2
+import torch
+import numpy as np
 from ultralytics import YOLO
 
-# YOLO modelini yükle
+# YOLO modelini yukle
 model = YOLO("yolo11n.pt")
 
-# Kamerayı aç
+# MiDaS icin cihaz ve model ayarla
+if torch.cuda.is_available():
+    cihaz = torch.device("cuda")
+else:
+    cihaz = torch.device("cpu")
+
+print("MiDaS modeli yukleniyor...")
+
+midas = torch.hub.load(
+    "intel-isl/MiDaS",
+    "MiDaS_small"
+)
+
+midas.to(cihaz)
+midas.eval()
+
+donusumler = torch.hub.load(
+    "intel-isl/MiDaS",
+    "transforms"
+)
+
+donusum = donusumler.small_transform
+
+print("MiDaS hazir!")
+
+# Kamerayi ac
 kamera = cv2.VideoCapture(0)
+
+if not kamera.isOpened():
+    print("Kamera acilamadi.")
+    raise SystemExit
 
 while True:
     basarili, goruntu = kamera.read()
 
     if not basarili:
-        print("Kamera görüntüsü alınamadı.")
+        print("Kamera goruntusu alinamadi.")
         break
 
-    # Görüntünün genişliği
-    goruntu_genisligi = goruntu.shape[1]
+    # Ayna goruntusu
+    goruntu = cv2.flip(goruntu, 1)
 
-    # YOLO ile görüntüyü analiz et
-    sonuclar = model(goruntu, imgsz=640, verbose=False)
+    goruntu_yuksekligi, goruntu_genisligi = goruntu.shape[:2]
 
-    # İlk görüntünün sonucunu al
+    # MiDaS ile derinlik tahmini yap
+    rgb = cv2.cvtColor(goruntu, cv2.COLOR_BGR2RGB)
+    girdi = donusum(rgb).to(cihaz)
+
+    with torch.no_grad():
+        tahmin = midas(girdi)
+
+        tahmin = torch.nn.functional.interpolate(
+            tahmin.unsqueeze(1),
+            size=(goruntu_yuksekligi, goruntu_genisligi),
+            mode="bicubic",
+            align_corners=False
+        ).squeeze()
+
+    derinlik = tahmin.cpu().numpy()
+
+    # Derinlik degerlerini 0-1 araligina getir
+    alt_sinir = np.percentile(derinlik, 5)
+    ust_sinir = np.percentile(derinlik, 95)
+
+    if ust_sinir > alt_sinir:
+        derinlik_norm = np.clip(
+            (derinlik - alt_sinir) / (ust_sinir - alt_sinir),
+            0,
+            1
+        )
+    else:
+        derinlik_norm = np.zeros_like(derinlik)
+
+    # Derinlik haritasini renkli goster
+    derinlik_goruntu = (
+        derinlik_norm * 255
+    ).astype(np.uint8)
+
+    renkli_derinlik = cv2.applyColorMap(
+        derinlik_goruntu,
+        cv2.COLORMAP_MAGMA
+    )
+
+    # YOLO ile nesneleri bul
+    sonuclar = model(
+        goruntu,
+        imgsz=640,
+        verbose=False
+    )
+
     sonuc = sonuclar[0]
 
-    # Tespit edilen nesneleri incele
     for kutu in sonuc.boxes:
 
-        # Güven değerini al
         guven = float(kutu.conf[0])
 
-        # Çok düşük güvenilirlikli nesneleri geç
         if guven < 0.30:
             continue
 
-        # Sınıf numarasını al
         sinif_no = int(kutu.cls[0])
-
-        # Nesne adını al
         nesne_adi = sonuc.names[sinif_no]
 
-        # Bounding box koordinatlarını al
-        x1, y1, x2, y2 = kutu.xyxy[0]
+        x1, y1, x2, y2 = map(
+            int,
+            kutu.xyxy[0].tolist()
+        )
 
-        # Tam sayıya çevir
-        x1 = int(x1)
-        y1 = int(y1)
-        x2 = int(x2)
-        y2 = int(y2)
+        # Koordinatlari goruntu sinirlari icinde tut
+        x1 = max(0, min(x1, goruntu_genisligi - 1))
+        x2 = max(0, min(x2, goruntu_genisligi))
+        y1 = max(0, min(y1, goruntu_yuksekligi - 1))
+        y2 = max(0, min(y2, goruntu_yuksekligi))
 
-        # Nesnenin merkez X koordinatı
+        # Nesnenin yatay merkezini hesapla
         merkez_x = (x1 + x2) // 2
 
         if merkez_x < goruntu_genisligi / 3:
-            konum = "sag"
-
+            konum = "sol"
         elif merkez_x < goruntu_genisligi * 2 / 3:
             konum = "orta"
-
         else:
-            konum = "sol"
+            konum = "sag"
 
-        # Ekranda gösterilecek yazı
-        yazi = f"{nesne_adi} - {konum} - %{guven * 100:.0f}"
+        # Nesnenin bolgesindeki derinligi bul
+        nesne_derinligi = derinlik_norm[y1:y2, x1:x2]
 
-        # Bounding box çiz
+        if nesne_derinligi.size > 0:
+            derinlik_degeri = float(
+                np.median(nesne_derinligi)
+            )
+
+            if derinlik_degeri >= 0.65:
+                mesafe = "yakin"
+            elif derinlik_degeri >= 0.35:
+                mesafe = "orta"
+            else:
+                mesafe = "uzak"
+        else:
+            mesafe = "bilinmiyor"
+
+        # Ekranda gosterilecek yazi
+        yazi = f"{nesne_adi} - {konum} - {mesafe} - %{guven * 100:.0f}"
+
+        # Nesnenin etrafina kutu ciz
         cv2.rectangle(
             goruntu,
             (x1, y1),
@@ -72,25 +158,25 @@ while True:
             2
         )
 
-        # Yazıyı göster
+        # Nesne bilgisini ekrana yaz
         cv2.putText(
             goruntu,
             yazi,
             (x1, max(y1 - 10, 20)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.6,
             (0, 255, 0),
             2
         )
 
-    # Kamerayı göster
-    cv2.imshow("Görsel Asistan", goruntu)
+    # Kamera ve derinlik haritasini goster
+    cv2.imshow("Gorsel Asistan", goruntu)
+    cv2.imshow("MiDaS Derinlik Haritasi", renkli_derinlik)
 
-    # Q tuşuyla çık
+    # Q tusuyla cik
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-# Kamerayı kapat
+# Kamera ve pencereleri kapat
 kamera.release()
 cv2.destroyAllWindows()
-
